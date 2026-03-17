@@ -492,6 +492,11 @@ class UsageManager: ObservableObject {
         }
 
         // If not in cookie, fetch from bootstrap
+        fetchBootstrapOrgId(cookie: cookie, retryCount: 0, completion: completion)
+    }
+
+    private func fetchBootstrapOrgId(cookie: String, retryCount: Int, completion: @escaping (String?) -> Void) {
+        let maxRetries = 3
         guard let url = URL(string: "https://claude.ai/api/bootstrap") else {
             completion(nil)
             return
@@ -499,11 +504,23 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(cookie)", forHTTPHeaderField: "Cookie")
+        request.timeoutInterval = 15
+        // Cookie is already the full cookie string (e.g. "sessionKey=abc; lastActiveOrg=xyz")
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
 
-        NSLog("📡 Fetching bootstrap to get org ID...")
+        NSLog("📡 Fetching bootstrap to get org ID (attempt \(retryCount + 1)/\(maxRetries + 1))...")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if error != nil && retryCount < maxRetries {
+                let delay = Double(1 << retryCount) * 2.0
+                NSLog("🔄 Bootstrap fetch failed, retrying in \(delay)s...")
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                    self?.fetchBootstrapOrgId(cookie: cookie, retryCount: retryCount + 1, completion: completion)
+                }
+                return
+            }
+
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let account = json["account"] as? [String: Any],
@@ -547,7 +564,8 @@ class UsageManager: ObservableObject {
         }
     }
 
-    func fetchUsageWithOrgId(_ orgId: String, for account: AccountData) {
+    func fetchUsageWithOrgId(_ orgId: String, for account: AccountData, retryCount: Int = 0) {
+        let maxRetries = 3
         let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
 
         guard let url = URL(string: urlString) else {
@@ -560,6 +578,7 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.timeoutInterval = 15
 
         // Use the full cookie string (user provides all cookies, not just sessionKey)
         request.setValue(account.sessionCookie, forHTTPHeaderField: "Cookie")
@@ -570,18 +589,41 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        NSLog("🔍 Fetching from: \(urlString) for account \(account.id)")
+        NSLog("🔍 Fetching from: \(urlString) for account \(account.id) (attempt \(retryCount + 1)/\(maxRetries + 1))")
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                account.isLoading = false
+            if let error = error {
+                NSLog("❌ Error for account \(account.id): \(error.localizedDescription)")
 
-                if let error = error {
-                    NSLog("❌ Error for account \(account.id): \(error.localizedDescription)")
-                    account.errorMessage = "Network error"
-                    self?.updateStatusBar()
+                // Retry on transient network errors
+                if retryCount < maxRetries {
+                    let delay = Double(1 << retryCount) * 2.0 // 2s, 4s, 8s
+                    NSLog("🔄 Retrying account \(account.id) in \(delay)s (attempt \(retryCount + 2)/\(maxRetries + 1))")
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                        self?.fetchUsageWithOrgId(orgId, for: account, retryCount: retryCount + 1)
+                    }
                     return
                 }
+
+                DispatchQueue.main.async {
+                    let nsError = error as NSError
+                    if nsError.code == NSURLErrorTimedOut {
+                        account.errorMessage = "Request timed out"
+                    } else if nsError.code == NSURLErrorNotConnectedToInternet {
+                        account.errorMessage = "No internet connection"
+                    } else if nsError.code == NSURLErrorNetworkConnectionLost {
+                        account.errorMessage = "Connection lost"
+                    } else {
+                        account.errorMessage = "Network error: \(nsError.localizedDescription)"
+                    }
+                    account.isLoading = false
+                    self?.updateStatusBar()
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                account.isLoading = false
 
                 guard let httpResponse = response as? HTTPURLResponse else {
                     account.errorMessage = "Invalid response"
@@ -597,6 +639,23 @@ class UsageManager: ObservableObject {
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data, for: account)
+                } else if httpResponse.statusCode == 403 || httpResponse.statusCode == 401 {
+                    account.errorMessage = "Cookie expired or invalid (HTTP \(httpResponse.statusCode))"
+                } else if httpResponse.statusCode == 429 {
+                    account.errorMessage = "Rate limited, try later"
+                } else if httpResponse.statusCode >= 500 {
+                    // Retry on server errors
+                    if retryCount < maxRetries {
+                        let delay = Double(1 << retryCount) * 2.0
+                        NSLog("🔄 Server error \(httpResponse.statusCode), retrying account \(account.id) in \(delay)s")
+                        DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                            self?.fetchUsageWithOrgId(orgId, for: account, retryCount: retryCount + 1)
+                        }
+                        // Keep isLoading true for retry
+                        account.isLoading = true
+                        return
+                    }
+                    account.errorMessage = "Server error (HTTP \(httpResponse.statusCode))"
                 } else {
                     account.errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
