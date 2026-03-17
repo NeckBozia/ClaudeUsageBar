@@ -496,7 +496,7 @@ class UsageManager: ObservableObject {
     }
 
     private func fetchBootstrapOrgId(cookie: String, retryCount: Int, completion: @escaping (String?) -> Void) {
-        let maxRetries = 3
+        let maxRetries = 2
         guard let url = URL(string: "https://claude.ai/api/bootstrap") else {
             completion(nil)
             return
@@ -513,7 +513,7 @@ class UsageManager: ObservableObject {
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             if error != nil && retryCount < maxRetries {
-                let delay = Double(1 << retryCount) * 2.0
+                let delay = retryCount == 0 ? 3.0 : 8.0
                 NSLog("🔄 Bootstrap fetch failed, retrying in \(delay)s...")
                 DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                     self?.fetchBootstrapOrgId(cookie: cookie, retryCount: retryCount + 1, completion: completion)
@@ -565,7 +565,7 @@ class UsageManager: ObservableObject {
     }
 
     func fetchUsageWithOrgId(_ orgId: String, for account: AccountData, retryCount: Int = 0) {
-        let maxRetries = 3
+        let maxRetries = 2
         let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
 
         guard let url = URL(string: urlString) else {
@@ -597,7 +597,7 @@ class UsageManager: ObservableObject {
 
                 // Retry on transient network errors
                 if retryCount < maxRetries {
-                    let delay = Double(1 << retryCount) * 2.0 // 2s, 4s, 8s
+                    let delay = retryCount == 0 ? 3.0 : 8.0 // 3s, 8s
                     NSLog("🔄 Retrying account \(account.id) in \(delay)s (attempt \(retryCount + 2)/\(maxRetries + 1))")
                     DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                         self?.fetchUsageWithOrgId(orgId, for: account, retryCount: retryCount + 1)
@@ -646,7 +646,7 @@ class UsageManager: ObservableObject {
                 } else if httpResponse.statusCode >= 500 {
                     // Retry on server errors
                     if retryCount < maxRetries {
-                        let delay = Double(1 << retryCount) * 2.0
+                        let delay = retryCount == 0 ? 3.0 : 8.0
                         NSLog("🔄 Server error \(httpResponse.statusCode), retrying account \(account.id) in \(delay)s")
                         DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                             self?.fetchUsageWithOrgId(orgId, for: account, retryCount: retryCount + 1)
